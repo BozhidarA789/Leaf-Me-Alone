@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Leaf Me Alone dashboard</title>
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<style>
+:root{--bg:#f4f7f2;--card:#fff;--ink:#16241a;--mute:#5c6b60;--green:#2e7d32;--amber:#c77700;--red:#c62828;--line:#dfe6dc}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,Segoe UI,Roboto,sans-serif}
+header{background:var(--green);color:#fff;padding:18px max(4vw,16px);display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between}
+h1{margin:0;font-size:24px}
+#conn{font-size:14px;padding:4px 10px;border-radius:99px;background:rgba(255,255,255,.2)}
+main{max-width:1100px;margin:auto;padding:20px max(4vw,16px)}
+#state{font-size:28px;font-weight:700;padding:16px 20px;border-radius:12px;background:var(--card);border-left:8px solid var(--mute);margin-bottom:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
+.tile .k{font-size:14px;color:var(--mute)}
+.tile .v{font-size:30px;font-weight:700;white-space:nowrap}
+.tile svg{width:100%;height:40px;display:block;margin-top:6px}
+section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-top:16px}
+h2{margin:0 0 10px;font-size:18px}
+form{display:flex;flex-wrap:wrap;gap:10px;align-items:end}
+label{font-size:14px;display:flex;flex-direction:column;gap:4px}
+input{font-size:16px;padding:8px;border:1px solid var(--line);border-radius:8px;width:130px}
+button{font-size:16px;padding:10px 16px;border:0;border-radius:8px;background:var(--green);color:#fff;cursor:pointer}
+#log{font:13px/1.4 ui-monospace,monospace;max-height:200px;overflow:auto;white-space:pre-wrap;color:var(--mute)}
+small{color:var(--mute)}
+</style>
+</head>
+<body>
+<header><h1>Leaf Me Alone 🌱 plant 1</h1><span id="conn">not connected</span></header>
+<main>
+  <section id="login">
+    <h2>Log in to the broker</h2>
+    <form id="loginForm">
+      <label>Username<input name="user" autocomplete="username" required></label>
+      <label>Password<input name="pass" type="password" autocomplete="current-password" required></label>
+      <button>Connect</button>
+    </form>
+    <small id="loginStatus"></small>
+  </section>
+  <div id="state">Waiting for data…</div>
+  <div class="grid" id="tiles"></div>
+  <small id="last"></small>
+
+  <section>
+    <h2>Alarm thresholds</h2>
+    <form id="cmd">
+      <label>Soil moisture min (%)<input name="soilMin" type="number" value="30"></label>
+      <label>Temperature min (°C)<input name="tempMin" type="number" value="15"></label>
+      <label>Temperature max (°C)<input name="tempMax" type="number" value="30"></label>
+      <label>Light min<input name="lightMin" type="number" value="200"></label>
+      <button>Send to device</button>
+    </form>
+    <small id="cmdStatus"></small>
+  </section>
+
+  <section>
+    <h2>Message log</h2>
+    <div id="log"></div>
+  </section>
+  <small>Broker: own Eclipse Mosquitto server on Azure (leafmealone.austriaeast.cloudapp.azure.com), MQTT over secure WebSockets, port 8081. Topics: leafmealone/plant1/telemetry, leafmealone/plant1/cmd.</small>
+</main>
+<script>
+{
+const BROKER = 'wss://leafmealone.austriaeast.cloudapp.azure.com:8081';
+const BASE = 'leafmealone/plant1/';
+const META = {temp:['Temperature','°C'],hum:['Air humidity','%'],pressure:['Air pressure','hPa'],light:['Light',''],soil:['Soil moisture','%'],tds:['Nutrients (TDS)','ppm']};
+const hist = {};
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+const log = t => { const d = $('log'); d.textContent = new Date().toLocaleTimeString() + '  ' + t + '\n' + d.textContent; };
+
+const spark = arr => {
+  if (arr.length < 2) return '';
+  const min = Math.min(...arr), max = Math.max(...arr), r = (max - min) || 1;
+  const pts = arr.map((v, i) => (i / (arr.length - 1) * 100).toFixed(1) + ',' + (38 - (v - min) / r * 36).toFixed(1)).join(' ');
+  return '<svg viewBox="0 0 100 40" preserveAspectRatio="none"><polyline fill="none" stroke="#2e7d32" stroke-width="2" vector-effect="non-scaling-stroke" points="' + pts + '"/></svg>';
+};
+
+const render = data => {
+  const tiles = Object.entries(data).filter(([, v]) => typeof v === 'number');
+  tiles.forEach(([k, v]) => { (hist[k] ||= []).push(v); if (hist[k].length > 60) hist[k].shift(); });
+  $('tiles').innerHTML = tiles.map(([k, v]) => {
+    const [name, unit] = META[k] || [k, ''];
+    return '<div class="tile"><div class="k">' + esc(name) + '</div><div class="v">' + esc(v) + ' ' + esc(unit) + '</div>' + spark(hist[k]) + '</div>';
+  }).join('');
+  if (data.state !== undefined) {
+    const s = String(data.state).toUpperCase();
+    const col = s === 'OK' ? 'var(--green)' : (s === 'CRITICAL' || s === 'ALARM') ? 'var(--red)' : 'var(--amber)';
+    $('state').textContent = 'Plant state: ' + s;
+    $('state').style.borderLeftColor = col;
+  }
+  $('last').textContent = 'Last update: ' + new Date().toLocaleString();
+};
+
+let client = null;
+const connect = (username, password) => {
+  if (client) client.end(true);
+  $('loginStatus').textContent = 'Connecting…';
+  client = mqtt.connect(BROKER, { username, password, clientId: 'lma-dash-' + Math.random().toString(16).slice(2, 8), reconnectPeriod: 5000 });
+  client.on('connect', () => {
+    $('conn').textContent = '● connected';
+    $('loginStatus').textContent = 'Connected as ' + username;
+    $('login').style.display = 'none';
+    client.subscribe(BASE + '#');
+    log('connected to ' + BROKER);
+  });
+  client.on('reconnect', () => { $('conn').textContent = 'reconnecting…'; });
+  client.on('offline', () => { $('conn').textContent = '○ offline'; });
+  client.on('error', e => {
+    log('error: ' + e.message);
+    $('loginStatus').textContent = /auth|password|5/i.test(e.message) ? 'Wrong username or password.' : 'Connection error: ' + e.message;
+    $('login').style.display = '';
+    client.end(true);
+  });
+  client.on('message', (topic, payload) => {
+    const text = payload.toString();
+    log(topic + '  ' + text);
+    if (topic === BASE + 'telemetry') {
+      try { render(JSON.parse(text)); } catch { log('not valid JSON'); }
+    }
+  });
+};
+$('loginForm').addEventListener('submit', e => {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  connect(f.get('user'), f.get('pass'));
+});
+
+$('cmd').addEventListener('submit', e => {
+  e.preventDefault();
+  if (!client || !client.connected) { $('cmdStatus').textContent = 'Not connected: log in first.'; return; }
+  const body = {};
+  new FormData(e.target).forEach((v, k) => { body[k] = Number(v); });
+  client.publish(BASE + 'cmd', JSON.stringify(body), { qos: 1 });
+  $('cmdStatus').textContent = 'Sent ' + JSON.stringify(body);
+});
+}
+</script>
+</body>
+</html>
